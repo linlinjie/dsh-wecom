@@ -54,6 +54,17 @@ export interface Reply {
    * the `render_card` tool), oldest first. Channels attach them to the reply.
    */
   images?: ImageAttachmentRef[]
+  /**
+   * Files declared through the `present` tool during the turn, oldest first.
+   * Channels attach them to the reply as file messages.
+   */
+  files?: PresentedFileRef[]
+}
+
+/** One file declared by the `present` tool (absolute or session-relative path). */
+export interface PresentedFileRef {
+  path: string
+  description?: string
 }
 
 /**
@@ -1551,6 +1562,7 @@ export class AgentPool {
     const pendingCalls = new Map<string, { name: string; arguments: string }>()
     const toolCalls: ToolCallSummary[] = []
     const images: ImageAttachmentRef[] = []
+    const files: PresentedFileRef[] = []
     // Forward one model delta to the streaming sink and, for reasoning, to the
     // final process summary. Both delta sources below funnel through here so
     // the two harness generations behave identically.
@@ -1615,6 +1627,11 @@ export class AgentPool {
             }
           }
         }
+      } else if ((event as { type: string }).type === 'deliverables/presented') {
+        // Files declared through the `present` tool are recorded as a session
+        // event; collect their paths so the channel can attach them.
+        const data = (event as { data: { files: PresentedFileRef[] } }).data
+        files.push(...data.files)
       }
     })
     // Record the turn's sender identity BEFORE the first prompt assembly:
@@ -1658,6 +1675,7 @@ export class AgentPool {
     if (reasoning.length > 0) reply.reasoning = reasoning.join('')
     if (toolCalls.length > 0) reply.toolCalls = toolCalls
     if (images.length > 0) reply.images = images
+    if (files.length > 0) reply.files = files
     return reply
   }
 

@@ -453,7 +453,11 @@ export class WecomChannel {
     if (Array.isArray(feedback.inaccurate_reason_list)) {
       payload.reasons = feedback.inaccurate_reason_list
     }
-    this.log.info('WeCom feedback: %s', JSON.stringify(payload))
+    const line = JSON.stringify(payload)
+    this.log.info('WeCom feedback: %s', line)
+    // Deployment escape hatch: some hosts route plugin loggers away from the
+    // process stderr, so mirror the line to stderr where journald can see it.
+    console.error('[wecom-feedback] %s', line)
   }
 
   private async onMessage(frame: WsFrame<BaseMessage>): Promise<void> {

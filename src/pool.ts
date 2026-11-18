@@ -682,7 +682,20 @@ export class AgentPool {
         const id = String(header.id)
         const cwd = (header as { cwd?: string }).cwd
         if (id.startsWith('dsh-wecom-') && cwd !== undefined) {
-          await this.groupSession(id, cwd)
+          // Mirror to stderr (the plugin logger does not reach journald on every
+          // deployment) and bound each attach: a single stuck attach previously
+          // blocked `start()` forever, so the long connection never opened.
+          console.error('[dsh-wecom] attach start %s', id)
+          await Promise.race([
+            this.groupSession(id, cwd),
+            new Promise<void>((resolve) => {
+              setTimeout(() => {
+                console.error('[dsh-wecom] attach TIMEOUT %s (continuing)', id)
+                resolve()
+              }, 5_000)
+            }),
+          ])
+          console.error('[dsh-wecom] attach done %s', id)
         }
       }
     }
@@ -1671,6 +1684,25 @@ export class AgentPool {
         (userid) => this.peekRtxFor(userid),
       )
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
+      // Push AFTER followup: `followup` emits `turn/start`, which resets the
+      // sink's per-turn state, so recording earlier would be overwritten.
+      try {
+        const sink = this.ctx.get('wecomTraceSink') as
+          | { record?: (payload: unknown) => void }
+          | undefined
+        console.error(
+          '[dsh-trace-sink] sink=%s userid=%s resolved=%s',
+          sink === undefined ? 'MISSING' : 'ok',
+          identity.userid,
+          JSON.stringify(identity.resolved ?? null).slice(0, 300),
+        )
+        sink?.record?.({
+          sessionId,
+          userid: identity.userid,
+          identity,
+          userText: (message as { text?: { content?: string } }).text?.content,
+        })
+      } catch {}
       await this.settleTurn(agent)
     } finally {
       off()

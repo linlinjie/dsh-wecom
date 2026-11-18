@@ -27,6 +27,9 @@ export async function runChannelLoop(
       log.warn('WeCom connection ended; restarting the channel')
     } catch (error) {
       if (isStopped()) return
+      // Mirror to stderr: the plugin logger is not wired to journald on every
+      // deployment, and a silent restart loop is impossible to diagnose.
+      console.error('[dsh-wecom] channel failed: %s; restarting', String(error))
       log.error('WeCom channel failed: %s; restarting', String(error))
     }
     await new Promise((resolve) => setTimeout(resolve, restartIntervalMs))

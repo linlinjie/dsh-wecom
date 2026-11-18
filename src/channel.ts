@@ -459,6 +459,16 @@ export class WecomChannel {
     // Deployment escape hatch: some hosts route plugin loggers away from the
     // process stderr, so mirror the line to stderr where journald can see it.
     console.error('[wecom-feedback] %s', line)
+    // Emit on the channel's own context so sibling plugins (tracing, ratings)
+    // can consume the verdict without scraping stderr.
+    try {
+      // The channel event is not part of cordis' typed `Events`; a narrow cast
+      // keeps the emit without widening the shared event map for every plugin.
+      const emitter = this.ctx as unknown as { emit: (name: string, ...args: unknown[]) => void }
+      emitter.emit('wecom-feedback', payload)
+    } catch (error) {
+      this.log.debug('wecom-feedback emit failed: %s', String(error))
+    }
   }
 
   private async onMessage(frame: WsFrame<BaseMessage>): Promise<void> {

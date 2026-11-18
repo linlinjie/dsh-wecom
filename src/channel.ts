@@ -1,4 +1,43 @@
+import { randomUUID } from 'node:crypto'
 import { appendFileSync } from 'node:fs'
+
+/** 企微把选择放在每一道题的 option_ids.option_id 里。 */
+function optionIdsOf(event: Record<string, unknown>, questionKey: string): string[] {
+  const items = (event.selected_items as { selected_item?: unknown } | undefined)?.selected_item
+  if (!Array.isArray(items)) {
+    return event.question_key === undefined || event.question_key === questionKey
+      ? stringIds(event.option_ids)
+      : []
+  }
+  return items.flatMap((item) => {
+    const choice = item as { question_key?: string; option_ids?: { option_id?: unknown } } | null
+    return choice?.question_key === questionKey ? stringIds(choice.option_ids?.option_id) : []
+  })
+}
+
+function stringIds(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : []
+}
+
+/** Demo vote card for `/card`: vertical options read better than a button row. */
+function buildDemoVoteCard(): TemplateCard {
+  return {
+    card_type: 'vote_interaction',
+    task_id: `demo-${randomUUID()}`,
+    main_title: { title: '卡片连通性测试', desc: '单选' },
+    sub_title_text: '选一项后点提交，机器人会回复「收到」。',
+    checkbox: {
+      question_key: 'demo_q1',
+      mode: 0,
+      option_list: [
+        { id: 'opt_a', text: '选项 A' },
+        { id: 'opt_b', text: '选项 B' },
+        { id: 'opt_c', text: '以上都不是' },
+      ],
+    },
+    submit_button: { text: '提交', key: 'demo_submit' },
+  }
+}
 
 /** Closing line appended to every reply so the 👍/👎 loop gets used. */
 export const FEEDBACK_FOOTER = '\n\n———\n如果回答准确，请点 👍；如果回答不好，请点 👎 反馈，谢谢。'
@@ -23,6 +62,8 @@ import {
   generateReqId,
   type Logger,
   type ReplyMsgItem,
+  type TemplateCard,
+  type TemplateCardEventData,
   type WeComMediaType,
   WSAuthFailureError,
   WSClient,
@@ -31,7 +72,7 @@ import {
   type WsFrame,
   type WsFrameHeaders,
 } from '@wecom/aibot-node-sdk'
-import type { ResolvedConfig } from './config.js'
+import type { ResolvedConfig, WecomIdentity } from './config.js'
 import { clipUtf8, Dedupe, replyTarget, timeout } from './helpers.js'
 import { AgentPool, type Reply } from './pool.js'
 
@@ -50,6 +91,43 @@ export interface WecomFeedbackEvent {
 /** `event.feedback_event` content: the SDK's `eventtype` plus the payload WeCom actually sends. */
 export type FeedbackEventContent = FeedbackEventData & { feedback_event?: WecomFeedbackEvent }
 
+/** `event.template_card_event` content: the SDK's `eventtype` plus WeCom's payload. */
+export type TemplateCardEventContent = TemplateCardEventData & {
+  template_card_event?: Record<string, unknown>
+}
+
+type QuestionAnswer = { answers: { id: string; selected: string[] }[] }
+type QuestionFallback = () => Promise<QuestionAnswer>
+
+interface QuestionRequest {
+  agent?: { session: { id: string } }
+  questions: {
+    id: string
+    question: string
+    detail?: string
+    options?: { label: string }[]
+    multiSelect?: boolean
+    intent?: unknown
+  }[]
+  signal?: AbortSignal
+  wait?: { timed?: boolean }
+}
+
+interface PendingQuestion {
+  card: TemplateCard
+  sessionId: string
+  recipient: WecomIdentity
+  settle: (label?: string) => void
+}
+
+type QuestionEvents = {
+  on(
+    event: 'user-questions/request',
+    handler: (request: QuestionRequest, next: QuestionFallback) => Promise<QuestionAnswer>,
+    options: { global: true; prepend: true },
+  ): () => void
+}
+
 /** The subset of the official SDK this channel calls (kept minimal for test doubles). */
 export interface BotClient {
   readonly isConnected: boolean
@@ -66,12 +144,18 @@ export interface BotClient {
     event: 'event.feedback_event',
     handler: (frame: WsFrame<EventMessageWith<FeedbackEventContent>>) => void | Promise<void>,
   ): this
+  on(
+    event: 'event.template_card_event',
+    handler: (frame: WsFrame<EventMessageWith<TemplateCardEventContent>>) => void | Promise<void>,
+  ): this
   on(event: 'event.disconnected_event', handler: () => void): this
   connect(): this
   disconnect(): void
   sendMessage(
     chatid: string,
-    body: { msgtype: 'markdown'; markdown: { content: string } },
+    body:
+      | { msgtype: 'markdown'; markdown: { content: string } }
+      | { msgtype: 'template_card'; template_card: TemplateCard },
   ): Promise<unknown>
   replyStream(
     frame: WsFrameHeaders,
@@ -85,6 +169,8 @@ export interface BotClient {
     frame: WsFrameHeaders,
     body: { msgtype: 'text'; text: { content: string } },
   ): Promise<unknown>
+  replyTemplateCard(frame: WsFrameHeaders, card: TemplateCard): Promise<unknown>
+  updateTemplateCard(frame: WsFrameHeaders, card: TemplateCard): Promise<unknown>
   uploadMedia(
     fileBuffer: Uint8Array,
     options: { type: WeComMediaType; filename: string },
@@ -119,6 +205,7 @@ export interface ChannelStatusService {
 const COMMANDS = new Set([
   '/ping',
   '/help',
+  '/card',
   '/status',
   '/stop',
   '/compact',
@@ -258,6 +345,8 @@ export class WecomChannel {
   private stopping = false
   private authenticatedAt: number | null = null
   private lastError: string | null = null
+  private disposeQuestionListener?: () => void
+  private readonly pendingQuestions = new Map<string, PendingQuestion>()
   /** Resolved when the connection is unrecoverable or the channel stops. */
   private dead = Promise.withResolvers<void>()
 
@@ -351,11 +440,18 @@ export class WecomChannel {
     client.on('message', async (frame) => this.onMessage(frame))
     client.on('event.enter_chat', async (frame) => this.greet(frame))
     client.on('event.feedback_event', async (frame) => this.onFeedback(frame))
+    client.on('event.template_card_event', async (frame) => this.onTemplateCardEvent(frame))
 
     try {
       client.connect()
       await timeout(ready.promise, this.config.connectTimeoutMs, 'WeCom authentication')
       this.log.info('WeCom AI Bot authenticated for Bot ID %s', this.config.botId)
+      // 老版编译依赖缺少事件类型，部署的 DSH 已提供问答事件。
+      this.disposeQuestionListener ??= (this.ctx as unknown as QuestionEvents).on(
+        'user-questions/request',
+        (request, next) => this.onQuestionRequest(request, next),
+        { global: true, prepend: true },
+      )
     } catch (error) {
       await this.stop()
       throw error
@@ -366,6 +462,9 @@ export class WecomChannel {
   async stop(): Promise<void> {
     if (this.stopping) return
     this.stopping = true
+    this.disposeQuestionListener?.()
+    this.disposeQuestionListener = undefined
+    for (const question of this.pendingQuestions.values()) question.settle()
     this.dead.resolve()
     this.client?.disconnect()
     await this.pool.dispose()
@@ -634,6 +733,7 @@ export class WecomChannel {
         [
           'dsh-wecom bot',
           '/ping — connectivity check',
+          '/card — send a demo vote card (card interaction test)',
           '/help — list commands',
           '/status — session status',
           '/stop — cancel the current generation',
@@ -647,6 +747,10 @@ export class WecomChannel {
         ].join('\n'),
         true,
       )
+      return
+    }
+    if (command === '/card') {
+      await this.sendCard(frame, buildDemoVoteCard())
       return
     }
     if (command === '/status') {
@@ -773,6 +877,174 @@ export class WecomChannel {
         'WeCom reply send',
       ),
     )
+  }
+
+  private readonly sentCards = new Map<string, TemplateCard>()
+
+  private async sendCard(frame: WsFrameHeaders, card: TemplateCard): Promise<void> {
+    if (card.task_id !== undefined) {
+      this.sentCards.set(card.task_id, card)
+      if (this.sentCards.size > 200) {
+        const oldest = this.sentCards.keys().next().value
+        if (oldest !== undefined) this.sentCards.delete(oldest)
+      }
+    }
+    await this.retry(async () =>
+      timeout(
+        this.liveClient().replyTemplateCard(frame, card),
+        this.config.sendTimeoutMs,
+        'WeCom template card send',
+      ),
+    )
+  }
+
+  private async onQuestionRequest(
+    request: QuestionRequest,
+    next: QuestionFallback,
+  ): Promise<QuestionAnswer> {
+    const sessionId = request.agent?.session.id
+    const [question] = request.questions
+    if (sessionId === undefined || question === undefined || request.questions.length !== 1) {
+      return next()
+    }
+    const recipient = this.pool.questionRecipient(sessionId)
+    const labels = question.options?.map((option) => option.label) ?? []
+    const text = question.detail ? `${question.question}\n${question.detail}` : question.question
+    // 只接管能完整显示的单选题。审批、开放题和多题仍交给原有回答端。
+    if (
+      !this.client?.isConnected ||
+      recipient === undefined ||
+      question.intent !== undefined ||
+      question.multiSelect === true ||
+      request.wait?.timed === true ||
+      labels.length < 2 ||
+      labels.length > 20 ||
+      new Set(labels).size !== labels.length ||
+      labels.some((label) => label.trim() === '' || [...label].length > 11) ||
+      [...text].length > 112
+    ) {
+      return next()
+    }
+    const skipped = { answers: [{ id: question.id, selected: [] }] }
+    const signal = request.signal
+    if (signal?.aborted) return skipped
+
+    const taskId = `ask-${randomUUID()}`
+    const card: TemplateCard = {
+      task_id: taskId,
+      card_type: 'vote_interaction',
+      main_title: { title: '请选择' },
+      sub_title_text: text,
+      checkbox: {
+        question_key: 'choice',
+        mode: 0,
+        option_list: labels.map((label, index) => ({ id: `opt_${index + 1}`, text: label })),
+      },
+      submit_button: { text: '提交', key: 'submit' },
+    }
+    const answer = Promise.withResolvers<QuestionAnswer>()
+    const settle = (label?: string): void => {
+      if (!this.pendingQuestions.delete(taskId)) return
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      console.error('[wecom-question] %s %s', taskId, label === undefined ? 'closed' : 'answered')
+      answer.resolve(
+        label === undefined
+          ? skipped
+          : {
+              answers: [{ id: question.id, selected: [label] }],
+            },
+      )
+    }
+    const onAbort = (): void => settle()
+    const timer = setTimeout(onAbort, Math.min(120_000, this.config.turnTimeoutMs))
+    timer.unref?.()
+    this.pendingQuestions.set(taskId, { card, sessionId, recipient, settle })
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    // 这里沿用原工具的等待 Promise。把点选送回消息队列会排在正在等待的回合后面。
+    try {
+      const sending = this.liveClient().sendMessage(recipient.userid, {
+        msgtype: 'template_card',
+        template_card: card,
+      })
+      void timeout(sending, this.config.sendTimeoutMs, 'WeCom question card send').then(
+        () => console.error('[wecom-question] %s sent', taskId),
+        (error: unknown) => {
+          this.log.warn('WeCom question card send failed: %s', String(error))
+          settle()
+        },
+      )
+    } catch (error) {
+      this.log.warn('WeCom question card send failed: %s', String(error))
+      settle()
+    }
+    return answer.promise
+  }
+
+  private async updateCard(frame: WsFrameHeaders, card: TemplateCard): Promise<void> {
+    // 更新只能在点击回调的响应窗口内用该帧提交一次。
+    await timeout(
+      this.liveClient().updateTemplateCard(frame, card),
+      Math.min(5_000, this.config.sendTimeoutMs),
+      'WeCom template card update',
+    )
+  }
+
+  private async onTemplateCardEvent(
+    frame: WsFrame<EventMessageWith<TemplateCardEventContent>>,
+  ): Promise<void> {
+    const body = frame.body
+    const event = body?.event.template_card_event
+    if (body === undefined || event === undefined || typeof event.task_id !== 'string') return
+    const taskId = event.task_id
+    const pending = this.pendingQuestions.get(taskId)
+    if (pending !== undefined) {
+      const single = body.chattype === 'single' || (body.chattype === undefined && !body.chatid)
+      if (!single || body.from.userid !== pending.recipient.userid) return
+      if (this.pool.questionRecipient(pending.sessionId) !== pending.recipient) {
+        pending.settle()
+        return
+      }
+    }
+    const original = pending?.card ?? this.sentCards.get(taskId)
+    const checkbox = original?.checkbox
+    if (original === undefined || checkbox === undefined) return
+    const optionIds = optionIdsOf(event, checkbox.question_key)
+    if (optionIds.length !== 1) return
+    const picked = checkbox.option_list.find((option) => option.id === optionIds[0])
+    if (picked === undefined) return
+
+    // 有效选择才消耗待答状态。后续回调无论是否重复携带选项，都不会触发第二次。
+    if (pending !== undefined) pending.settle(picked.text)
+    else this.sentCards.delete(taskId)
+    const locked: TemplateCard = {
+      ...original,
+      checkbox: {
+        ...checkbox,
+        disable: true,
+        option_list: checkbox.option_list.map((option) => ({
+          ...option,
+          is_checked: option.id === picked.id,
+        })),
+      },
+      ...(original.submit_button !== undefined
+        ? { submit_button: { ...original.submit_button, text: '已提交' } }
+        : {}),
+    }
+    try {
+      await this.updateCard(frame, locked)
+    } catch (error) {
+      this.log.warn('WeCom template card update failed: %s', String(error))
+    }
+    if (pending !== undefined) return
+    // /card 是独立连通性测试。原生工具回合会在收到答案后继续回复。
+    try {
+      const peer = body.chatid || body.from.userid
+      await this.pushToPeer(peer, `收到：${picked.text}`)
+    } catch (error) {
+      this.log.warn('WeCom template card ack failed: %s', String(error))
+    }
   }
 
   /**

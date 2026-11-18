@@ -1135,6 +1135,14 @@ export class AgentPool {
     return this.titlePrefixes.get(sessionId) ?? this.peers.get(this.baseId(sessionId))
   }
 
+  /** 只接管当前企微单聊回合的问题。网页回合或切换前的会话没有答题权限。 */
+  questionRecipient(sessionId: string): WecomIdentity | undefined {
+    const identity = this.turnIdentities.get(sessionId)
+    if (identity?.chattype !== 'single') return undefined
+    const base = this.baseId(sessionId)
+    return this.withEpoch(base, this.epochs.get(base) ?? 0) === sessionId ? identity : undefined
+  }
+
   /**
    * Feed one message to its conversation's agent, serialized per conversation.
    * `onDelta` receives streamed model text and reasoning deltas as they are

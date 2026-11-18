@@ -7,7 +7,8 @@ import {
   FEEDBACK_FOOTER,
   WecomChannel,
 } from '../src/channel.js'
-import type { Config } from '../src/config.js'
+import type { Config, WecomIdentity } from '../src/config.js'
+import { conversationId } from '../src/helpers.js'
 import { testConfig } from './test-config.js'
 
 function makeClient() {
@@ -30,6 +31,8 @@ function makeClient() {
     replyStream: vi.fn(async () => undefined),
     sendMessage: vi.fn(async () => undefined),
     replyWelcome: vi.fn(async () => undefined),
+    replyTemplateCard: vi.fn(async () => undefined),
+    updateTemplateCard: vi.fn(async () => undefined),
     uploadMedia: vi.fn(async () => ({ media_id: 'media-1', created_at: String(Date.now()) })),
     sendMediaMessage: vi.fn(async () => undefined),
     downloadFile: vi.fn(async () => ({ buffer: new Uint8Array() })),
@@ -76,6 +79,166 @@ async function makeRunningChannel() {
   await channel.start()
   return { channel, client, fire }
 }
+
+describe('WeCom native questions', () => {
+  async function setup(config: Partial<Config> = {}) {
+    const { client, fire } = makeClient()
+    const ctx = makeCtx()
+    type Ask = (request: unknown, next: () => Promise<unknown>) => Promise<unknown>
+    let askHandler: Ask | undefined
+    const channel = new WecomChannel(
+      {
+        ...ctx,
+        on(name: string, handler: Ask) {
+          if (name === 'user-questions/request') askHandler = handler
+          return () => undefined
+        },
+      } as never,
+      testConfig(config),
+      () => client,
+    )
+    const sessionId = conversationId('default', { chattype: 'single', from: { userid: 'u1' } })
+    const pool = (
+      channel as unknown as {
+        pool: { turnIdentities: Map<string, WecomIdentity>; epochs: Map<string, number> }
+      }
+    ).pool
+    pool.turnIdentities.set(sessionId, { chattype: 'single', userid: 'u1' })
+    await channel.start()
+    if (askHandler === undefined) throw new Error('WeCom question listener did not register')
+    const ask = (signal?: AbortSignal, next = vi.fn(async () => ({ fallback: true }))) =>
+      askHandler?.(
+        {
+          agent: { session: { id: sessionId } },
+          questions: [
+            { id: 'fruit', question: '选一个水果', options: [{ label: '苹果' }, { label: '梨' }] },
+          ],
+          signal,
+        },
+        next,
+      )
+    const submit = (taskId: string, ids: string[], userid = 'u1', questionKey = 'choice') =>
+      fire('event.template_card_event', {
+        headers: { req_id: 'submit-frame' },
+        body: {
+          chattype: 'single',
+          from: { userid },
+          event: {
+            template_card_event: {
+              task_id: taskId,
+              selected_items: {
+                selected_item: [{ question_key: questionKey, option_ids: { option_id: ids } }],
+              },
+            },
+          },
+        },
+      })
+    const cardTaskId = () => {
+      const body = vi.mocked(client.sendMessage).mock.calls.at(-1)?.[1]
+      if (body?.msgtype !== 'template_card' || !body.template_card.task_id)
+        throw new Error('No card sent')
+      return body.template_card.task_id
+    }
+    return { channel, client, fire, pool, sessionId, ask, submit, cardTaskId }
+  }
+
+  it('accepts only the first valid selection from the asking user', async () => {
+    const { channel, client, ask, submit, cardTaskId } = await setup()
+    try {
+      const answer = ask()
+      const taskId = cardTaskId()
+      await submit(taskId, [])
+      await submit(taskId, ['opt_2'], 'u2')
+      await submit(taskId, ['unknown'])
+      await submit(taskId, ['opt_2'], 'u1', 'other-question')
+      expect(client.updateTemplateCard).not.toHaveBeenCalled()
+      await Promise.all([submit(taskId, ['opt_2']), submit(taskId, ['opt_1'])])
+      await expect(answer).resolves.toEqual({ answers: [{ id: 'fruit', selected: ['梨'] }] })
+      expect(client.sendMessage).toHaveBeenCalledTimes(1)
+      expect(client.updateTemplateCard).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ headers: { req_id: 'submit-frame' } }),
+        expect.objectContaining({
+          checkbox: expect.objectContaining({
+            disable: true,
+            option_list: [
+              expect.objectContaining({ id: 'opt_1', is_checked: false }),
+              expect.objectContaining({ id: 'opt_2', is_checked: true }),
+            ],
+          }),
+        }),
+      )
+    } finally {
+      await channel.stop()
+    }
+  })
+
+  it('does not let an old card answer a question after a session switch', async () => {
+    const { channel, client, ask, submit, cardTaskId, pool, sessionId } = await setup()
+    try {
+      const answer = ask()
+      const taskId = cardTaskId()
+      pool.epochs.set(sessionId, 1)
+      await submit(taskId, ['opt_1'])
+      await expect(answer).resolves.toEqual({ answers: [{ id: 'fruit', selected: [] }] })
+      expect(client.updateTemplateCard).not.toHaveBeenCalled()
+    } finally {
+      await channel.stop()
+    }
+  })
+
+  it('expires an unanswered card and ignores a late callback', async () => {
+    const { channel, client, ask, submit, cardTaskId } = await setup({ turnTimeoutMs: 50 })
+    try {
+      const answer = ask()
+      const taskId = cardTaskId()
+      await expect(answer).resolves.toEqual({ answers: [{ id: 'fruit', selected: [] }] })
+      await submit(taskId, ['opt_1'])
+      expect(client.updateTemplateCard).not.toHaveBeenCalled()
+    } finally {
+      await channel.stop()
+    }
+  })
+
+  it('preserves demo card replies and clears an aborted native card', async () => {
+    const { channel, client, fire, ask, submit, cardTaskId } = await setup()
+    try {
+      const controller = new AbortController()
+      const answer = ask(controller.signal)
+      const taskId = cardTaskId()
+      controller.abort()
+      await expect(answer).resolves.toEqual({ answers: [{ id: 'fruit', selected: [] }] })
+      await submit(taskId, ['opt_1'])
+      expect(client.updateTemplateCard).not.toHaveBeenCalled()
+
+      await sendText(fire, '/card')
+      const demoId = vi.mocked(client.replyTemplateCard).mock.calls[0]?.[1].task_id
+      if (demoId === undefined) throw new Error('No demo card sent')
+      await submit(demoId, [], 'u1', 'demo_q1')
+      await submit(demoId, ['opt_b'], 'u1', 'demo_q1')
+      await submit(demoId, ['opt_a'], 'u1', 'demo_q1')
+      expect(client.updateTemplateCard).toHaveBeenCalledTimes(1)
+      expect(client.sendMessage).toHaveBeenLastCalledWith('u1', {
+        msgtype: 'markdown',
+        markdown: { content: '收到：选项 B' },
+      })
+    } finally {
+      await channel.stop()
+    }
+  })
+
+  it('delegates questions that did not originate from a WeCom turn', async () => {
+    const { channel, client, ask, pool, sessionId } = await setup()
+    try {
+      pool.turnIdentities.delete(sessionId)
+      const next = vi.fn(async () => ({ fallback: true }))
+      await expect(ask(undefined, next)).resolves.toEqual({ fallback: true })
+      expect(next).toHaveBeenCalledTimes(1)
+      expect(client.sendMessage).not.toHaveBeenCalled()
+    } finally {
+      await channel.stop()
+    }
+  })
+})
 
 describe('WecomChannel status', () => {
   it('starts disconnected with empty counters', () => {

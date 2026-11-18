@@ -211,6 +211,11 @@ export interface Config {
   dedupeLimit: number
   /** Upper bound on concurrently running agent turns across all conversations. */
   maxConcurrent: number
+  /**
+   * Interrupt the running turn when a new message arrives (`true`, "插队"), or
+   * queue the new message behind it and answer both (`false`, default).
+   */
+  preempt: boolean
   /** Delay before the channel restarts after a dead or failed connection. */
   restartIntervalMs: number
   /**
@@ -283,6 +288,7 @@ export const Config: z<Config> = z.object({
   replyLimitBytes: z.number().step(1).min(100).max(204_800).default(20_000),
   dedupeLimit: z.number().step(1).min(100).max(100_000).default(5_000),
   maxConcurrent: z.number().step(1).min(1).max(64).default(4),
+  preempt: z.boolean().default(false),
   /** Delay before the channel restarts after a dead or failed connection. */
   restartIntervalMs: z.number().step(1).min(100).default(10_000),
   /** Sibling namespaces aggregated into the default row's status payload. */

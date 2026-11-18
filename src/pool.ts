@@ -1135,13 +1135,15 @@ export class AgentPool {
   ): Promise<Reply> {
     const { base, id } = this.locate(message)
     const target = this.skipArchived(base, id)
-    // Preempt (插队): a new message interrupts any RUNNING turn of this
-    // conversation. `agent.cancel` makes the in-flight turn settle promptly
-    // (its `settleTurn` waits on `whenIdle`), so the new message is driven
-    // right after instead of queueing behind a long analysis. Different
-    // conversations stay independent (bounded by maxConcurrent).
-    const agent = this.agents.get(target)?.agent ?? this.ctx.agents.get(SessionId(target))
-    if (agent !== undefined && agent.status !== 'idle') agent.cancel({ kind: 'user' })
+    // Preempt (插队), opt-in via `preempt: true`: a new message interrupts any
+    // RUNNING turn of this conversation so it is driven right after instead of
+    // queueing behind a long analysis. The default queues — the new message
+    // waits on `chains` and both get an answer, which is what a chat reader
+    // expects after typing twice in a row.
+    if (this.config.preempt) {
+      const agent = this.agents.get(target)?.agent ?? this.ctx.agents.get(SessionId(target))
+      if (agent !== undefined && agent.status !== 'idle') agent.cancel({ kind: 'user' })
+    }
     const previous = this.chains.get(target) ?? Promise.resolve()
     const current = previous
       .catch(() => undefined)

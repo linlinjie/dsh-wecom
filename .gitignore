@@ -20,3 +20,6 @@ coverage/
 .DS_Store
 *.swp
 *.tgz
+
+# 本地交接材料，不入库
+HANDOFF-card.md

@@ -1,7 +1,12 @@
 import { rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { type BotClient, buildStreamContent, WecomChannel } from '../src/channel.js'
+import {
+  type BotClient,
+  buildStreamContent,
+  FEEDBACK_FOOTER,
+  WecomChannel,
+} from '../src/channel.js'
 import type { Config } from '../src/config.js'
 import { testConfig } from './test-config.js'
 
@@ -299,7 +304,7 @@ describe('WecomChannel streaming', () => {
     expect(calls[1]?.[3]).toBe(false)
     const final = calls[2]
     expect(final?.[3]).toBe(true)
-    expect(String(final?.[2])).toBe('<think>工具调用:\n- read: a</think>\nHello')
+    expect(String(final?.[2])).toBe('<think>工具调用:\n- read: a</think>\nHello' + FEEDBACK_FOOTER)
   })
 
   it('combines reasoning and tool calls inside one think block', async () => {
@@ -330,7 +335,9 @@ describe('WecomChannel streaming', () => {
     )
 
     const final = calls[2]
-    expect(String(final?.[2])).toBe('<think>thinking…\n\n工具调用:\n- bash: ls</think>\nHi')
+    expect(String(final?.[2])).toBe(
+      '<think>thinking…\n\n工具调用:\n- bash: ls</think>\nHi' + FEEDBACK_FOOTER,
+    )
   })
 
   it('wraps reasoning in a native <think> block ahead of the answer', async () => {
@@ -354,7 +361,7 @@ describe('WecomChannel streaming', () => {
 
     const final = calls[2]
     expect(final?.[3]).toBe(true)
-    expect(String(final?.[2])).toBe('<think>thinking…</think>\nHi')
+    expect(String(final?.[2])).toBe('<think>thinking…</think>\nHi' + FEEDBACK_FOOTER)
     // Intermediate stream frames carry the think block too, so the client can
     // render its thinking card while the answer is still streaming.
     expect(calls[1]?.[2]).toBe('<think>thinking…</think>\nHi')
@@ -381,7 +388,7 @@ describe('WecomChannel streaming', () => {
     )
 
     const final = calls[2]
-    expect(String(final?.[2])).toBe('<think>abc</think>\nHi')
+    expect(String(final?.[2])).toBe('<think>abc</think>\nHi' + FEEDBACK_FOOTER)
   })
 
   it('routes /clear as a /new alias', async () => {
@@ -795,7 +802,11 @@ describe('WecomChannel feedback', () => {
     expect(info).toHaveBeenCalledWith('WeCom feedback: %s', expect.stringContaining('"type":2'))
     expect(info).toHaveBeenCalledWith(
       'WeCom feedback: %s',
-      expect.stringContaining('"reasons":[2]'),
+      expect.stringContaining('"reasonIds":[2]'),
+    )
+    expect(info).toHaveBeenCalledWith(
+      'WeCom feedback: %s',
+      expect.stringContaining('"reasons":["内容不完整"]'),
     )
   })
 

@@ -1,4 +1,16 @@
 import { appendFileSync } from 'node:fs'
+
+/** Closing line appended to every reply so the 👍/👎 loop gets used. */
+export const FEEDBACK_FOOTER = '\n\n———\n如果回答准确，请点 👍；如果回答不好，请点 👎 反馈，谢谢。'
+
+/** WeCom negative-feedback reason ids -> labels (feedback-event docs). */
+const NEGATIVE_REASON_LABELS: Record<number, string> = {
+  1: '与内容无关',
+  2: '内容不完整',
+  3: '内容有错误',
+  4: '数据分析错误',
+}
+
 import { readFile } from 'node:fs/promises'
 import { basename, isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -452,7 +464,13 @@ export class WecomChannel {
     }
     if (typeof feedback.content === 'string') payload.content = feedback.content.slice(0, 2000)
     if (Array.isArray(feedback.inaccurate_reason_list)) {
-      payload.reasons = feedback.inaccurate_reason_list
+      // WeCom sends numeric ids here (1 与内容无关 / 2 内容不完整 /
+      // 3 内容有错误 / 4 数据分析错误, per the feedback-event docs). Keep the
+      // ids for machine filtering and add the labels so trace consumers can
+      // read the verdict without a lookup table.
+      const ids = feedback.inaccurate_reason_list
+      payload.reasonIds = ids
+      payload.reasons = ids.map((id) => NEGATIVE_REASON_LABELS[id] ?? `unknown:${id}`)
     }
     const line = JSON.stringify(payload)
     this.log.info('WeCom feedback: %s', line)
@@ -878,8 +896,12 @@ export class WecomChannel {
   private renderReply(reply: Reply): string {
     const process = this.renderProcess(reply)
     const processBytes = Buffer.byteLength(process) + 16
-    const textBudget = Math.max(0, this.config.replyLimitBytes - processBytes)
-    return buildStreamContent(process, clipUtf8(reply.text, textBudget), true)
+    // Reserve room for the footer so the budget still clips the answer, not the
+    // call to action.
+    const footerBytes = Buffer.byteLength(FEEDBACK_FOOTER)
+    const textBudget = Math.max(0, this.config.replyLimitBytes - processBytes - footerBytes)
+    const body = clipUtf8(reply.text, textBudget) + FEEDBACK_FOOTER
+    return buildStreamContent(process, body, true)
   }
 
   /**
